@@ -3,104 +3,136 @@ package parser
 import (
 	"bufio"
 	"fmt"
+	"mlua-evaluator/ast"
 	"regexp"
 	"strings"
 )
 
 var (
-	annotationRegex = regexp.MustCompile(`^\s*@[A-Za-z0-9_]+(\(.*?\))?\s*$`)
-	scriptRegex     = regexp.MustCompile(`^(\s*)script\s+([A-Za-z0-9_]+)`)
-	propertyRegex   = regexp.MustCompile(`^(\s*)property\s+([A-Za-z0-9_]+)\s+([A-Za-z0-9_]+)\s*(?:=\s*(.*))?$`)
-	methodRegex     = regexp.MustCompile(`^(\s*)method\s+([A-Za-z0-9_]+)\s+([A-Za-z0-9_]+)\s*\((.*)\)\s*$`)
+	classRegex    = regexp.MustCompile(`^\s*script\s+([A-Za-z0-9_]+)`)
+	propertyRegex = regexp.MustCompile(`^\s*property\s+([A-Za-z0-9_]+)\s+([A-Za-z0-9_]+)\s*(?:=\s*(.*))?$`)
+	methodRegex   = regexp.MustCompile(`^\s*method\s+([A-Za-z0-9_]+)\s+([A-Za-z0-9_]+)\s*\((.*)\)\s*.*$`)
+	testCaseRegex = regexp.MustCompile(`^\s*test\s*"([^"]+)"\s*"([^"]+)"\s*=\s*{([^}]+)}`)
+	metaRegex     = regexp.MustCompile(`^\s*@([A-Za-z0-9_]+)\((.*)\)`)
+	commentRegex  = regexp.MustCompile(`^\s*--\s*(.*)`)
 )
 
-type MethodParam struct {
-	Name string
-	Type string
+// Parse takes the content of a .mlua file and returns a structured *ast.ParsedMluaFile.
+func Parse(content string) (*ast.ParsedMluaFile, error) {
+	parsedFile := &ast.ParsedMluaFile{
+		Metadata: make(map[string]string),
+	}
+	scanner := bufio.NewScanner(strings.NewReader(content))
+	var currentComments []string
+
+	for scanner.Scan() {
+		line := scanner.Text()
+
+		if matches := commentRegex.FindStringSubmatch(line); len(matches) > 1 {
+			currentComments = append(currentComments, matches[1])
+			continue
+		}
+
+		if matches := metaRegex.FindStringSubmatch(line); len(matches) > 2 {
+			key := matches[1]
+			value := strings.Trim(matches[2], `"`)
+			parsedFile.Metadata[key] = value
+			parsedFile.Comments = append(parsedFile.Comments, currentComments...)
+			currentComments = nil
+			continue
+		}
+
+		if matches := classRegex.FindStringSubmatch(line); len(matches) > 0 {
+			parsedFile.ClassName = matches[1]
+			parsedFile.Comments = append(parsedFile.Comments, currentComments...)
+			currentComments = nil
+			continue
+		}
+
+		if matches := propertyRegex.FindStringSubmatch(line); len(matches) > 0 {
+			prop := ast.Property{
+				Type:     matches[1],
+				Name:     matches[2],
+				Comments: currentComments,
+			}
+			parsedFile.Properties = append(parsedFile.Properties, prop)
+			currentComments = nil
+			continue
+		}
+
+		if matches := methodRegex.FindStringSubmatch(line); len(matches) > 0 {
+			method := ast.Method{
+				ReturnType: matches[1],
+				Name:       matches[2],
+				Parameters: parseMethodParams(matches[3]),
+				Comments:   currentComments,
+			}
+			parsedFile.Methods = append(parsedFile.Methods, method)
+			currentComments = nil
+			continue
+		}
+
+		if matches := testCaseRegex.FindStringSubmatch(line); len(matches) > 3 {
+			testCase := ast.TestCase{
+				Name:        matches[1],
+				Description: matches[2],
+				Comments:    currentComments,
+			}
+
+			parts := strings.Split(matches[3], ",")
+			if len(parts) >= 2 {
+				testCase.Target = strings.TrimSpace(parts[0])
+				testCase.Input = parseTestInput(strings.Join(parts[1:len(parts)-1], ","))
+				testCase.Expected = strings.TrimSpace(parts[len(parts)-1])
+			}
+
+			parsedFile.TestCases = append(parsedFile.TestCases, testCase)
+			currentComments = nil
+			continue
+		}
+
+		// If a line is not a comment and not a recognized structure, and there are pending comments,
+		// associate them with the file-level comments if no class has been defined yet.
+		if strings.TrimSpace(line) != "" && len(currentComments) > 0 && parsedFile.ClassName == "" {
+			parsedFile.Comments = append(parsedFile.Comments, currentComments...)
+			currentComments = nil
+		}
+	}
+
+	if err := scanner.Err(); err != nil {
+		return nil, fmt.Errorf("error reading mLua content: %w", err)
+	}
+
+	return parsedFile, nil
 }
 
-// parseArgs takes a string like "number amount, string name" and returns a slice of MethodParam
-func parseArgs(argString string) []MethodParam {
+func parseMethodParams(argString string) []ast.MethodParam {
 	if strings.TrimSpace(argString) == "" {
 		return nil
 	}
-	params := []MethodParam{}
+	params := []ast.MethodParam{}
 	parts := strings.Split(argString, ",")
 	for _, part := range parts {
 		part = strings.TrimSpace(part)
 		subParts := strings.Fields(part)
 		if len(subParts) >= 2 {
-			paramType := strings.Join(subParts[:len(subParts)-1], " ")
-			paramName := subParts[len(subParts)-1]
-			params = append(params, MethodParam{Name: paramName, Type: paramType})
-		} else if len(subParts) == 1 {
-			params = append(params, MethodParam{Name: subParts[0], Type: "any"})
+			paramType := subParts[0]
+			paramName := subParts[1]
+			params = append(params, ast.MethodParam{Name: paramName, Type: paramType})
 		}
 	}
 	return params
 }
 
-// Transpile converts mLua syntax into standard Lua 5.3 syntax
-func Transpile(mluaCode string) (string, error) {
-	scanner := bufio.NewScanner(strings.NewReader(mluaCode))
-	var out []string
-	currentClass := ""
-
-	for scanner.Scan() {
-		line := scanner.Text()
-
-		if annotationRegex.MatchString(line) {
-			continue
-		}
-
-		if matches := scriptRegex.FindStringSubmatch(line); len(matches) > 0 {
-			indent := matches[1]
-			currentClass = matches[2]
-			out = append(out, fmt.Sprintf("%s%s = {}", indent, currentClass))
-			continue
-		}
-
-		if matches := propertyRegex.FindStringSubmatch(line); len(matches) > 0 {
-			indent := matches[1]
-			name := matches[3]
-			val := matches[4]
-			if val == "" {
-				val = "nil"
-			}
-			if currentClass != "" {
-				out = append(out, fmt.Sprintf("%s%s.%s = %s", indent, currentClass, name, val))
-			} else {
-				out = append(out, fmt.Sprintf("%slocal %s = %s", indent, name, val))
-			}
-			continue
-		}
-
-		if matches := methodRegex.FindStringSubmatch(line); len(matches) > 0 {
-			indent := matches[1]
-			methodName := matches[3]
-			argsString := matches[4]
-
-			params := parseArgs(argsString)
-			var paramNames []string
-			var sigParts []string
-			for _, p := range params {
-				paramNames = append(paramNames, p.Name)
-				sigParts = append(sigParts, fmt.Sprintf("%s:%s", p.Name, p.Type))
-			}
-
-			signature := fmt.Sprintf("%s-- @method_signature: %s(%s)", indent, methodName, strings.Join(sigParts, ","))
-			out = append(out, signature)
-
-			if currentClass != "" {
-				out = append(out, fmt.Sprintf("%sfunction %s:%s(%s)", indent, currentClass, methodName, strings.Join(paramNames, ", ")))
-			} else {
-				out = append(out, fmt.Sprintf("%sfunction %s(%s)", indent, methodName, strings.Join(paramNames, ", ")))
-			}
-			continue
-		}
-
-		out = append(out, line)
+func parseTestInput(inputStr string) []string {
+	inputStr = strings.TrimSpace(inputStr)
+	if inputStr == "" {
+		return nil
 	}
-
-	return strings.Join(out, "\n"), scanner.Err()
+	parts := strings.Split(inputStr, ",")
+	trimmedParts := make([]string, len(parts))
+	for i, part := range parts {
+		trimmedParts[i] = strings.TrimSpace(part)
+	}
+	return trimmedParts
 }
