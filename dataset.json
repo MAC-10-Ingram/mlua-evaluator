@@ -1,0 +1,20 @@
+{
+  "test_cases": [
+    {
+      "name": "TakeDamage test",
+      "target_method": "Unit:TakeDamage",
+      "mocks": [
+        "Unit.hp = 1000"
+      ],
+      "inputs": {
+        "amount": 200
+      },
+      "asserts": [
+        {
+          "actual": "Unit.hp",
+          "expected": 800
+        }
+      ]
+    }
+  ]
+}

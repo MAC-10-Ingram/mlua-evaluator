@@ -1,0 +1,13 @@
+@Component
+script Unit extends Component
+
+	@Sync
+	property number hp = 500
+
+	property string name = "test"
+
+	@ExecSpace("Server")
+	method void TakeDamage(number amount)
+		self.hp = self.hp - amount
+	end
+end
